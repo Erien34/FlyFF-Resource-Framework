@@ -1,0 +1,59 @@
+#pragma once
+#include <QString>
+#include <QStringList>
+#include <QColor>
+
+#include "BehaviorManager.h"
+#include "ControlType.h"
+
+struct ControlData
+{
+    // --- Basisdaten ---
+    QString type;       // WTYPE_BUTTON, WTYPE_STATIC, ...
+    QString id;         // WIDC_xxx
+    QString texture;    // "WndEditTile00.tga"
+
+    // --- Layoutkoordinaten ---
+    int mod0 = 0;       // Mode / Unk1 (nach der Textur)
+    int x = 0;         // left
+    int y = 0;         // top
+    int x1 = 0;         // right
+    int y1 = 0;         // bottom
+
+    // --- Flags ---
+    QString flagsHex;   // 0x220000 etc.
+
+    // --- Reservierte Felder / Padding ---
+    int mod1 = 0;
+    int mod2 = 0;
+    int mod3 = 0;
+    int mod4 = 0;
+
+    // --- Farbe ---
+    QColor color = QColor(255, 255, 255);
+
+    // --- Strings / Unterblöcke ---
+    QString titleId;    // // Title String – IDS_RESDATA_INC_xxx
+    QString tooltipId;  // // ToolTip – IDS_RESDATA_INC_xxx
+
+    // --- Debug / Metadaten ---
+    int sourceLine = 0;      // Zeilennummer in der Layoutdatei
+    QString rawHeader;       // ursprüngliche Textzeile
+    QStringList tokens;      // Tokenliste zur Analyse
+    bool valid = false;
+
+    quint32 flagsMask = 0;             // Effektive Bitmaske
+    QVector<QString> resolvedMask;     // Einzel gesetzte Flags
+
+    // --- Zerlegte Flags ---
+    quint32 lowFlags  = 0;   // 0–15  → ControlFlags.json
+    quint32 midFlags  = 0;   // 16–23 → Engine / Behavior reserved bits
+    quint32 highFlags = 0;   // 24–31 → Render / Script reserved bits
+
+    bool disabled = false;
+    bool isPressed = false;
+    bool isHovered = false;
+
+    BehaviorInfo behavior;
+    ControlType mappedType = ControlType::Unknown;
+};

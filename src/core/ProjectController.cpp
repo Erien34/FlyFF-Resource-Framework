@@ -1,0 +1,758 @@
+#include "core/ProjectController.h"
+#include "core/ConfigManager.h"
+#include "core/FileManager.h"
+#include "define/DefineBackend.h"
+#include "define/DefineManager.h"
+#include "define/FlagManager.h"
+#include "text/TextBackend.h"
+#include "text/TextManager.h"
+#include "layout/LayoutParser.h"
+#include "layout/LayoutBackend.h"
+#include "utils/ResourceUtils.h"
+#include "layout/model/TokenData.h"
+#include "ui/WindowPanel.h"
+#include "ui/PropertyPanel.h"
+#include "render/RenderManager.h"
+#include "theme/ThemeManager.h"
+#include "behavior/BehaviorManager.h"
+#include "Canvas.h"
+#include "ProcessedThemeColors.h"
+
+
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QDir>
+#include <QDebug>
+#include <QTimer>
+#include <QMessageBox>
+
+// --------------------------------------------------
+// Konstruktor
+// --------------------------------------------------
+ProjectController::ProjectController(QObject* parent)
+    : QObject(parent)
+{
+    // ---------- EXISTIERENDE MANAGER ----------
+    m_configManager   = std::make_unique<ConfigManager>();
+    m_fileManager     = std::make_unique<FileManager>(m_configManager.get());
+    m_layoutParser    = std::make_unique<LayoutParser>();
+    m_layoutBackend   = std::make_unique<LayoutBackend>(*m_fileManager, *m_layoutParser);
+    m_defineManager   = std::make_unique<DefineManager>();
+    m_defineBackend   = std::make_unique<DefineBackend>();
+    m_flagManager     = std::make_unique<FlagManager>(m_configManager.get());
+    m_textManager     = std::make_unique<TextManager>();
+    m_textBackend     = std::make_unique<TextBackend>();
+    m_layoutManager   = std::make_unique<LayoutManager>(*m_layoutParser, *m_layoutBackend);
+
+    m_themeManager    = std::make_unique<ThemeManager>(m_fileManager.get());
+    m_behaviorManager = std::make_unique<BehaviorManager>(
+        m_flagManager.get(),
+        m_textManager.get(),
+        m_defineManager.get(),
+        m_layoutManager.get(),
+        m_layoutBackend.get());
+
+    // ---------- NEUE ENGINE-KOMPONENTEN ----------
+    m_layoutEngine = std::make_unique<LayoutEngine>(
+        m_themeManager.get(),
+        m_behaviorManager.get());
+
+    m_behaviorEngine = std::make_unique<BehaviorEngine>(
+        m_behaviorManager.get(),
+        m_layoutEngine.get());
+
+    m_renderManager = std::make_unique<RenderManager>(
+        m_themeManager.get(),
+        m_behaviorManager.get());
+
+    // LayoutManager verbindet Behavior
+    m_layoutManager->setBehaviorManager(m_behaviorManager.get());
+
+    // Tokens (Layout Parser)
+    connect(m_layoutManager.get(), &LayoutManager::tokensReady,
+            this, &ProjectController::onTokensReady);
+
+    qInfo() << "[ProjectController] Modernisiert initialisiert.";
+}
+
+void ProjectController::onTokensReady()
+{
+    qInfo() << "[ProjectController] TokensReady empfangen -> Rebuild Define/Text Manager";
+
+    m_tokensReady = true;
+
+    // 1) Alle Tokens flach sammeln (Define/Text Manager brauchen die Listen)
+    const auto tokenMap = TokenData::instance().all();   // QMap<QString, QList<Token>>
+
+    QList<Token> flatTokens;
+    flatTokens.reserve(20000);
+
+    for (const auto& list : tokenMap)
+        flatTokens.append(list);
+
+    // 2) DefineManager: nur REBUILD – kein apply!
+    if (m_defineManager)
+        m_defineManager->rebuildFromTokens(flatTokens);
+
+    // 3) TextManager: nur REBUILD – kein apply!
+    if (m_textManager)
+        m_textManager->rebuildFromTokens(flatTokens);
+
+    // 4) LayoutManager kümmert sich danach selbst um Behavior etc.
+    //    (Apply passiert später in loadProject(), wenn Layout vollständig vorliegt)
+    qInfo() << "[ProjectController] Token-basierter Rebuild abgeschlossen.";
+}
+
+// --------------------------------------------------
+// Projekt laden (mit automatischer Benutzerabfrage)
+// --------------------------------------------------
+bool ProjectController::loadProject(const QString& configPath)
+{
+    qInfo() << "[ProjectController] Starte Projekt-Ladevorgang...";
+    m_loadingActive = true;
+    m_tokensReady = false;
+
+    const QString cfgFile = configPath.isEmpty()
+                                ? ConfigManager::defaultConfigPath()
+                                : configPath;
+
+    // ---------------------------------------------------
+    // 0) Config initial erzeugen falls nicht vorhanden
+    // ---------------------------------------------------
+    if (!QFileInfo::exists(cfgFile)) {
+
+        QString resdataFile = QFileDialog::getOpenFileName(
+            nullptr, "Wähle deine Layout-Datei (resdata.inc)",
+            QString(), "Layout-Dateien (*.inc *.txt);;Alle Dateien (*.*)");
+        if (resdataFile.isEmpty()) return false;
+
+        QString iconDir = QFileDialog::getExistingDirectory(nullptr, "Wähle den Icon-Ordner");
+        if (iconDir.isEmpty()) return false;
+
+        QString themeDir = QFileDialog::getExistingDirectory(nullptr, "Wähle den Theme-Ordner");
+        if (themeDir.isEmpty()) return false;
+
+        QString sourceDir;
+        while (sourceDir.isEmpty() || !QDir(sourceDir).exists()) {
+            sourceDir = QFileDialog::getExistingDirectory(nullptr, "Wähle den Source-Ordner (Pflicht)");
+            if (sourceDir.isEmpty()) {
+                QMessageBox::warning(nullptr, "Pflichtfeld",
+                                     "Der Source-Ordner ist erforderlich, um Flags zu erzeugen.");
+            }
+        }
+
+        m_configManager->setLayoutPath(resdataFile);
+        m_configManager->setIconPath(iconDir);
+        m_configManager->setThemePath(themeDir);
+        m_configManager->setSourcePath(sourceDir);
+        m_configManager->save(cfgFile);
+    }
+
+    // ---------------------------------------------------
+    // 1) Config laden
+    // ---------------------------------------------------
+    if (!m_configManager->load(cfgFile)) {
+        qWarning() << "[ProjectController] Konnte Config nicht laden:" << cfgFile;
+        return false;
+    }
+
+    const QString resdataFile = m_configManager->layoutPath();
+    m_fileManager->cacheLayoutPath(resdataFile);
+
+    const QString themeDir  = m_configManager->themePath();
+    const QString iconDir   = m_configManager->iconPath();
+    const QString sourceDir = m_configManager->sourcePath();
+
+    // ---------------------------------------------------
+    // 1b) Game-Source-Farben extrahieren  ← HIER EINSETZEN
+    // ---------------------------------------------------
+    qInfo() << "[ProjectController] Extrahiere Farben aus Game-Source...";
+    if (!m_themeManager->loadGameSourceColors(sourceDir)) {
+        qWarning() << "[ProjectController] WARNUNG: Konnte Game-Source-Farben nicht extrahieren!";
+    } else {
+        qInfo() << "[ProjectController] Game-Source-Farben erfolgreich geladen:"
+                << m_themeManager->processedColors().colors.size();
+    }
+
+    const QString uiColorPath = m_fileManager->uiColorsPath();
+
+    if (!QFileInfo::exists(uiColorPath))
+    {
+        qInfo() << "[ProjectController] ui_colors.json nicht gefunden → speichere extrahierte Farben";
+
+        // Farben stammen aus dem bereits erfolgten loadGameSourceColors-Aufruf:
+        const QMap<QString, QColor>& extracted =
+            m_themeManager->processedColors().colors;
+
+        if (!m_themeManager->saveUiColorsJson(extracted, uiColorPath))
+            qWarning() << "[ProjectController] ui_colors.json konnte nicht gespeichert werden!";
+    }
+    else
+    {
+        qInfo() << "[ProjectController] ui_colors.json vorhanden → lade UI-Farben";
+    }
+
+    // JSON laden (unabhängig davon ob neu oder existent)
+    gProcessedColors.loadFromJson(uiColorPath);
+
+    qInfo() << "[ProjectController] UI-Farben geladen aus:" << uiColorPath;
+    // ---------------------------------------------------
+    // 2) Flags generieren falls nötig
+    // ---------------------------------------------------
+    const QString configDir = QFileInfo(cfgFile).absolutePath();
+    const QString wndFlagsPath  = configDir + "/window_flags.json";
+    const QString ctrlFlagsPath = configDir + "/control_flags.json";
+
+    const bool flagsMissing =
+        !QFileInfo::exists(wndFlagsPath) ||
+        !QFileInfo::exists(ctrlFlagsPath);
+
+    if (flagsMissing) {
+        qInfo() << "[ProjectController] Flags fehlen → Erstelle neu.";
+
+        m_flagManager->generateFlags(sourceDir, wndFlagsPath, ctrlFlagsPath);
+        m_flagManager->generateRuleTemplates(configDir);
+        m_flagManager->generateFlagGroups(configDir);
+    } else {
+        qInfo() << "[ProjectController] Flags vorhanden → nicht neu generieren.";
+
+        m_flagManager->extendRuleFile(configDir + "/window_flag_rules.json",
+                                      m_flagManager->windowFlags());
+        m_flagManager->extendRuleFile(configDir + "/control_flag_rules.json",
+                                      m_flagManager->controlFlags());
+        m_flagManager->extendFlagGroups(configDir + "/flag_groups.json");
+    }
+
+    // ---------------------------------------------------
+    // 3) BehaviorManager Flags einlesen
+    // ---------------------------------------------------
+    m_behaviorManager->refreshFlagsFromFiles();
+
+    // ---------------------------------------------------
+    // 4) Layout laden
+    // ---------------------------------------------------
+    m_layoutBackend->setPath(resdataFile);
+    m_layoutBackend->load();                      // Tokens generieren
+    m_layoutManager->refreshFromParser();         // Tokens → Raw Layout
+    m_layoutManager->processLayout();             // Behavior wird HIER angewendet!
+
+    emit layoutsReady();
+
+    auto windows = m_layoutManager->processedWindows();
+    qInfo() << "[ProjectController] Processed Layouts:" << windows.size();
+
+    // ---------------------------------------------------
+    // 5) Defines + Texte anwenden
+    // ---------------------------------------------------
+    const QString defineFile  = m_fileManager->findDefineFile(resdataFile);
+    const QString textFile    = m_fileManager->findTextFile(resdataFile);
+    const QString textIncFile = m_fileManager->findTextIncFile(resdataFile);
+
+    if (!defineFile.isEmpty())
+        m_defineBackend->load(defineFile, *m_defineManager);
+
+    if (!textFile.isEmpty())
+        m_textBackend->loadText(textFile, *m_textManager);
+
+    if (!textIncFile.isEmpty())
+        m_textBackend->loadInc(textIncFile, *m_textManager);
+
+    m_defineManager->applyDefinesToLayout(windows);
+    m_textManager->applyTextsToLayout(windows);
+
+    // ---------------------------------------------------
+    // 6) Ressourcen laden
+    // ---------------------------------------------------
+    m_icons = ResourceUtils::loadIcons(iconDir);
+
+    QString defaultTheme = "Default";
+    if (QDir(m_fileManager->themeFolderPath("English")).exists())
+        defaultTheme = "English";
+
+    qInfo().noquote() << "[ProjectController] Lade Theme:" << defaultTheme;
+    m_themeManager->loadTheme(defaultTheme);
+
+    // ---------------------------------------------------
+    // 7) Projekt finalisieren
+    // ---------------------------------------------------
+    emit projectLoaded();
+
+    QTimer::singleShot(0, this, [this, windows]() {
+        if (!windows.empty() && windows.front()) {
+            emit windowsReady(windows);
+            emit activeWindowChanged(windows.front());
+        }
+    });
+
+    m_loadingActive = false;
+    return true;
+}
+
+
+// --------------------------------------------------
+// Projekt speichern
+// --------------------------------------------------
+bool ProjectController::saveProject()
+{
+    // ----------------------------------------------------------
+    // Sicherheit: Prüfen, ob alles da ist
+    // ----------------------------------------------------------
+    if (!m_layoutManager || !m_layoutBackend) {
+        qWarning() << "[ProjectController] Layout-Komponenten fehlen!";
+        return false;
+    }
+
+    if (!m_defineManager || !m_defineBackend) {
+        qWarning() << "[ProjectController] Define-Komponenten fehlen!";
+        return false;
+    }
+
+    if (!m_textManager || !m_textBackend) {
+        qWarning() << "[ProjectController] Text-Komponenten fehlen!";
+        return false;
+    }
+
+    QString layoutPath = m_fileManager->layoutPath();
+    if (layoutPath.isEmpty()) {
+        qWarning() << "[ProjectController] Kein Layout-Pfad gesetzt!";
+        return false;
+    }
+
+    QString definePath = m_fileManager->definePath();
+    if (definePath.isEmpty()) {
+        qWarning() << "[ProjectController] Kein Define-Pfad gesetzt!";
+        return false;
+    }
+
+    // ----------------------------------------------------------
+    // 1️⃣ Layout speichern
+    // ----------------------------------------------------------
+    QString layoutContent = m_layoutManager->serializeLayout();
+    if (!m_layoutBackend->writeFile(layoutPath, layoutContent)) {
+        qWarning() << "[ProjectController] Layout speichern fehlgeschlagen!";
+        return false;
+    }
+
+    // ----------------------------------------------------------
+    // 2️⃣ Defines speichern
+    // ----------------------------------------------------------
+    if (!m_defineBackend->saveDefines(definePath, *m_defineManager)) {
+        qWarning() << "[ProjectController] Define-Datei speichern fehlgeschlagen!";
+        return false;
+    }
+
+    // ----------------------------------------------------------
+    // 3️⃣ Texte speichern (nur wenn Dirty)
+    // ----------------------------------------------------------
+    QString textPath;
+    QString textIncPath;
+    if (m_textManager->isDirty()) {
+        textPath = m_fileManager->textPath();
+        if (textPath.isEmpty()) {
+            qWarning() << "[ProjectController] Kein Text-Pfad gefunden!";
+            return false;
+        }
+
+        textIncPath = m_fileManager->textIncPath();
+        if (textIncPath.isEmpty()) {
+            qWarning() << "[ProjectController] Kein Text-INC-Pfad gefunden!";
+            return false;
+        }
+
+        if (!m_textBackend->saveText(textPath, *m_textManager)) {
+            qWarning() << "[ProjectController] Textdatei speichern fehlgeschlagen!";
+            return false;
+        }
+
+        if (!m_textBackend->saveInc(textIncPath, *m_textManager)) {
+            qWarning() << "[ProjectController] Text-INC-Datei speichern fehlgeschlagen!";
+            return false;
+        }
+
+        m_textManager->clearDirty();
+    } else {
+        textPath    = m_fileManager->textPath();
+        textIncPath = m_fileManager->textIncPath();
+    }
+
+    // ----------------------------------------------------------
+    // Fertig!
+    // ----------------------------------------------------------
+    emit projectSaved();
+    qInfo().noquote()
+        << "[ProjectController] Projekt erfolgreich gespeichert:"
+        << "\n   Layout :" << layoutPath
+        << "\n   Defines:" << definePath
+        << "\n   Texte  :" << (textPath.isEmpty() ? QStringLiteral("<unbekannt>") : textPath)
+        << "\n   Text-INC:" << (textIncPath.isEmpty() ? QStringLiteral("<unbekannt>") : textIncPath);
+
+    return true;
+}
+
+void ProjectController::selectWindow(const QString& windowName)
+{
+    if (!m_layoutManager)
+        return;
+
+    auto wnd = m_layoutManager->findWindow(windowName);
+    if (!wnd)
+        return;
+
+    m_currentWindow  = wnd;
+    m_currentControl = nullptr;     // wenn Fenster gewählt → Control zurücksetzen
+
+    qInfo() << "[ProjectController] Window selected:" << windowName;
+
+    emit selectionChanged();
+    emit activeWindowChanged(wnd);
+}
+
+void ProjectController::selectControl(const QString& windowName, const QString& controlName)
+{
+    if (!m_layoutManager)
+        return;
+
+    auto wnd = m_layoutManager->findWindow(windowName);
+    if (!wnd)
+        return;
+
+    std::shared_ptr<ControlData> foundCtrl;
+    for (const auto& ctrl : wnd->controls)
+    {
+        if (ctrl && ctrl->id == controlName)
+        {
+            foundCtrl = ctrl;
+            break;
+        }
+    }
+
+    if (!foundCtrl)
+        return;
+
+    m_currentWindow  = wnd;
+    m_currentControl = foundCtrl;
+
+    qInfo() << "[ProjectController] Control selected:" << controlName << "in" << windowName;
+
+    emit selectionChanged();
+}
+
+void ProjectController::bindCanvas(Canvas* canvas)
+{
+    if (!canvas) return;
+
+    // Canvas mit Engines versorgen
+    canvas->setEngines(
+        m_renderManager.get(),
+        m_behaviorEngine.get());
+
+    // Wenn ProjectController das Fenster wechselt → Canvas aktualisieren
+    connect(this, &ProjectController::activeWindowChanged,
+            canvas, &Canvas::setActiveWindow);
+
+    // Wenn RenderManager sagt „Bitte neu zeichnen“
+    connect(this, &ProjectController::uiRefreshRequested,
+            canvas, QOverload<>::of(&Canvas::update));
+}
+
+void ProjectController::bindPanels(WindowPanel* windowPanel, PropertyPanel* propertyPanel)
+{
+    if (!windowPanel || !propertyPanel)
+        return;
+
+    qInfo() << "[ProjectController] Panels verbunden (entkoppelt).";
+
+    // ----------------------------------------------------
+    // 🔹 Verbindung: WindowPanel → Controller
+    // ----------------------------------------------------
+    connect(windowPanel, &WindowPanel::windowSelected,
+            this, &ProjectController::selectWindow);
+
+    connect(windowPanel, &WindowPanel::controlSelected,
+            this, [this](const QString& wndName, const QString& ctrlName) {
+                selectControl(wndName, ctrlName);
+            });
+
+    // ----------------------------------------------------
+    // 🔹 Verbindung: Controller → PropertyPanel
+    // ----------------------------------------------------
+    connect(this, &ProjectController::selectionChanged,
+            this, [this, propertyPanel]() {
+                auto wnd = currentWindow();
+                auto ctrl = currentControl();
+
+                if (ctrl)
+                    propertyPanel->showControlProps(wnd, ctrl);
+                else if (wnd)
+                    propertyPanel->showWindowProps(wnd);
+                else
+                    propertyPanel->clear();
+            });
+
+    // ----------------------------------------------------
+    // 🔹 Verbindung: Controller → PropertyPanel Refresh
+    // ----------------------------------------------------
+    connect(this, &ProjectController::uiRefreshRequested, propertyPanel, [this, propertyPanel]() {
+        if (!propertyPanel || propertyPanel->isHidden())
+            return;
+
+        auto wnd = currentWindow();
+        auto ctrl = currentControl();
+
+        if (!ctrl && !wnd)
+            return;
+
+        QSignalBlocker blocker(propertyPanel);
+
+        if (ctrl)
+            propertyPanel->showControlProps(wnd, ctrl);
+        else
+            propertyPanel->showWindowProps(wnd);
+    });
+
+    // ----------------------------------------------------
+    // 🔹 Verbindung: PropertyPanel → Controller (Flags geändert)
+    // ----------------------------------------------------
+    connect(propertyPanel, &PropertyPanel::flagsChanged,
+            this, [this](quint32 newMask) {
+                auto wnd  = currentWindow();
+                auto ctrl = currentControl();
+
+                if (!m_behaviorManager) {
+                    qWarning() << "[ProjectController] Kein BehaviorManager vorhanden – Flags ignoriert.";
+                    return;
+                }
+                if (!wnd && !ctrl) {
+                    qWarning() << "[ProjectController] Kein aktives Fenster oder Control beim Flag-Update.";
+                    return;
+                }
+
+                const QMap<QString, quint32> flagMap =
+                    (ctrl ? m_behaviorManager->controlFlags()
+                          : m_behaviorManager->windowFlags());
+
+                if (ctrl) {
+                    ctrl->flagsMask = newMask;
+                    ctrl->resolvedMask.clear();
+
+                    for (auto it = flagMap.constBegin(); it != flagMap.constEnd(); ++it) {
+                        if (ctrl->flagsMask & it.value())
+                            ctrl->resolvedMask << it.key();
+                    }
+
+                    // Konsistent: BehaviorManager darf noch zusätzliche Dinge tun
+                    m_behaviorManager->updateControlFlags(ctrl);
+
+                    qInfo() << "[ProjectController] Control flags aktualisiert für" << ctrl->id;
+                }
+                else if (wnd) {
+                    wnd->flagsMask = newMask;
+                    wnd->resolvedMask.clear();
+
+                    for (auto it = flagMap.constBegin(); it != flagMap.constEnd(); ++it) {
+                        if (wnd->flagsMask & it.value())
+                            wnd->resolvedMask << it.key();
+                    }
+
+                    m_behaviorManager->updateWindowFlags(wnd);
+
+                    qInfo() << "[ProjectController] Window flags aktualisiert für" << wnd->name;
+                }
+
+                qInfo() << "[ProjectController] → UI-Refresh angefordert";
+                emit uiRefreshRequested();
+            });
+
+
+    // ----------------------------------------------------
+    // 🔹 Initialisierung nach Projekt-Ladevorgang
+    // ----------------------------------------------------
+    connect(this, &ProjectController::windowsReady,
+            this, [this, propertyPanel](const std::vector<std::shared_ptr<WindowData>>& windows) {
+                if (!windows.empty() && windows.front())
+                    propertyPanel->showWindowProps(windows.front());
+            });
+
+    // ----------------------------------------------------
+    // 🔹 Erster Refresh, falls bereits aktiv
+    // ----------------------------------------------------
+    if (auto wnd = currentWindow())
+        propertyPanel->showWindowProps(wnd);
+}
+
+
+void ProjectController::toggleControlFlag(const QString& flagName, bool enabled)
+{
+    auto ctrl = currentControl();
+    if (!ctrl || !m_behaviorManager)
+        return;
+
+    const auto& flagMap = m_behaviorManager->controlFlags();
+    if (!flagMap.contains(flagName))
+        return;
+
+    quint32 bit = flagMap.value(flagName);
+
+    if (enabled)
+        ctrl->flagsMask |= bit;
+    else
+        ctrl->flagsMask &= ~bit;
+
+    ctrl->resolvedMask.clear();
+    for (auto it = flagMap.constBegin(); it != flagMap.constEnd(); ++it) {
+        if (ctrl->flagsMask & it.value())
+            ctrl->resolvedMask << it.key();
+    }
+
+    qInfo().noquote() << QString("[ProjectController] Control flags aktualisiert für \"%1\"")
+                             .arg(ctrl->id);
+
+    emit uiRefreshRequested();
+}
+
+void ProjectController::toggleWindowFlag(const QString& flag, bool enable)
+{
+    if (!m_currentWindow || !m_behaviorManager)
+        return;
+
+    const auto& map = m_behaviorManager->windowFlags();
+    if (!map.contains(flag))
+        return;
+
+    quint32 bit = map[flag];
+    if (enable)
+        m_currentWindow->flagsMask |= bit;
+    else
+        m_currentWindow->flagsMask &= ~bit;
+
+    m_behaviorManager->updateWindowFlags(m_currentWindow);
+
+    emit uiRefreshRequested();
+}
+
+std::shared_ptr<WindowData> ProjectController::findWindow(const QString& name) const
+{
+    auto lm = layoutManager();
+    if (!lm)
+        return nullptr;
+
+    // LayoutManager hat eigene findWindow()
+    return lm->findWindow(name);
+}
+
+std::shared_ptr<ControlData> ProjectController::findControl(const QString& id) const
+{
+    auto wnd = currentWindow();
+    if (!wnd)
+        return nullptr;
+
+    for (const auto& ctrl : wnd->controls) {
+        if (ctrl && ctrl->id == id)
+            return ctrl;
+    }
+
+    return nullptr;
+}
+
+void ProjectController::updateWindowFlags(const QString& windowName, quint32 mask, bool enabled)
+{
+    auto wnd = findWindow(windowName);
+    if (!wnd) {
+        qWarning().noquote() << "[ProjectController] updateWindowFlags(): Window nicht gefunden:" << windowName;
+        return;
+    }
+
+    if (!m_behaviorManager) {
+        qWarning().noquote() << "[ProjectController] updateWindowFlags(): Kein BehaviorManager verfügbar.";
+        return;
+    }
+
+    // Flag-Namen aus BehaviorManager holen
+    const auto& allFlags = m_behaviorManager->windowFlags();
+    QString flagName;
+
+    for (auto it = allFlags.constBegin(); it != allFlags.constEnd(); ++it) {
+        if (it.value() == mask) {
+            flagName = it.key();
+            break;
+        }
+    }
+
+    if (flagName.isEmpty()) {
+        qWarning().noquote() << "[ProjectController] Unbekannter Flag-Mask:"
+                             << QString("0x%1").arg(mask, 0, 16);
+        return;
+    }
+
+    // Flag setzen oder entfernen
+    if (enabled) {
+        wnd->flagsMask |= mask;
+        if (!wnd->resolvedMask.contains(flagName))
+            wnd->resolvedMask.append(flagName);
+    } else {
+        wnd->flagsMask &= ~mask;
+        wnd->resolvedMask.removeAll(flagName);
+    }
+
+    // BehaviorManager aktualisiert ggf. weitere abgeleitete Infos
+    m_behaviorManager->updateWindowFlags(wnd);
+
+    qInfo().noquote() << QString("[ProjectController] Window '%1' Flags aktualisiert → %2 (%3)")
+                             .arg(windowName)
+                             .arg(flagName)
+                             .arg(enabled ? "ON" : "OFF");
+
+    emit uiRefreshRequested();
+}
+
+void ProjectController::updateControlFlags(const QString& controlId, quint32 mask, bool enabled)
+{
+    auto ctrl = findControl(controlId);
+    if (!ctrl) {
+        qWarning().noquote() << "[ProjectController] updateControlFlags(): Control nicht gefunden:" << controlId;
+        return;
+    }
+
+    if (!m_behaviorManager) {
+        qWarning().noquote() << "[ProjectController] updateControlFlags(): Kein BehaviorManager verfügbar.";
+        return;
+    }
+
+    const auto& allFlags = m_behaviorManager->controlFlags();
+    QString flagName;
+
+    for (auto it = allFlags.constBegin(); it != allFlags.constEnd(); ++it) {
+        if (it.value() == mask) {
+            flagName = it.key();
+            break;
+        }
+    }
+
+    if (flagName.isEmpty()) {
+        qWarning().noquote() << "[ProjectController] Unbekannter Control-Flag-Mask:"
+                             << QString("0x%1").arg(mask, 0, 16);
+        return;
+    }
+
+    // Maske aktualisieren
+    if (enabled)
+        ctrl->flagsMask |= mask;
+    else
+        ctrl->flagsMask &= ~mask;
+
+    // BehaviorManager baut resolvedMask neu auf / ergänzt
+    m_behaviorManager->updateControlFlags(ctrl);
+
+    qInfo().noquote() << QString("[ProjectController] Control '%1' Flags aktualisiert → %2 (%3)")
+                             .arg(controlId)
+                             .arg(flagName)
+                             .arg(enabled ? "ON" : "OFF");
+
+    emit uiRefreshRequested();
+}
+void ProjectController::requestUiRefreshAsync()
+{
+    QTimer::singleShot(0, this, [this]() {
+        emit uiRefreshRequested();
+    });
+}
